@@ -286,12 +286,22 @@ make report       # generates report
 
 ## Stretch goals (extra credit)
 
-- **Concurrency**: `ThreadPoolExecutor` in `run_simulation` — show metrics differ under concurrent load
-- **Redis circuit state**: Store breaker counters in Redis (INCR, EXPIRE) for multi-instance state sharing
-- **Redis graceful degradation**: Fall back to in-memory cache if Redis is down
-- **Cost-aware routing**: After budget hits 80%, route to cheaper model; at 100%, cache-only or static
-- **Property-based tests**: Use `hypothesis` to fuzz circuit breaker state transitions
-- **SLO table**: Define SLOs (availability >= 99%, P95 < 2.5s), check if system meets them
+All six are implemented — see `reports/final_report.md` §10 for evidence and demo output.
+
+- **Concurrency** (done): `load_test.concurrency` in config, `ThreadPoolExecutor` in
+  `chaos.py:run_scenario()`. See `configs/concurrency_demo.yaml`, `tests/test_concurrency.py`.
+- **Redis circuit state** (done): `CircuitBreaker(redis_client=...)` mirrors failure counts via
+  INCR/EXPIRE, wired automatically in `build_gateway()` when `cache.backend: redis`. See
+  `tests/test_redis_circuit_state.py`.
+- **Redis graceful degradation** (done): `build_gateway()` pings Redis before committing to the
+  redis cache backend and falls back to `ResponseCache` on failure. See
+  `tests/test_redis_graceful_degradation.py`.
+- **Cost-aware routing** (done): `BudgetConfig` (`config.py`) + `budget:` section in YAML configs,
+  routes to the cheapest provider at `warning_pct` utilization, static-fallback at 100%. See
+  `configs/budget_demo.yaml`, `tests/test_gateway_budget.py`.
+- **Property-based tests** (done): `tests/test_circuit_breaker_properties.py` fuzzes the state
+  machine with `hypothesis` (6 invariants, 200 examples each).
+- **SLO table** (done): `reports/final_report.md` §3.
 
 ---
 

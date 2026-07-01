@@ -8,3 +8,8 @@ pytest>=8.2
 pytest-cov>=5.0
 ruff>=0.5
 mypy>=1.10
+types-PyYAML>=6.0
+hypothesis>=6.100
+
+[redis]
+redis>=5.0

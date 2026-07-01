@@ -1,0 +1,32 @@
+providers:
+  - name: primary
+    fail_rate: 0.0
+    base_latency_ms: 50
+    cost_per_1k_tokens: 0.01
+  - name: backup
+    fail_rate: 0.0
+    base_latency_ms: 50
+    cost_per_1k_tokens: 0.006
+circuit_breaker:
+  failure_threshold: 3
+  reset_timeout_seconds: 2
+  success_threshold: 1
+cache:
+  enabled: false
+  backend: memory
+  ttl_seconds: 300
+  similarity_threshold: 0.92
+  redis_url: "redis://localhost:6379/0"
+load_test:
+  requests: 100
+budget:
+  total: 0.01
+  warning_pct: 0.5
+
+# BONUS demo: cost-aware routing. Both providers healthy (fail_rate 0) so the only
+# variable is budget utilization — shows the 3 budget phases: normal routing (< 50%),
+# cheapest-provider-only (50-100%), static fallback / no API calls (>= 100%).
+scenarios:
+  - name: budget_pressure
+    description: "Both providers healthy; small budget forces cost-aware routing phases"
+    provider_overrides: {}

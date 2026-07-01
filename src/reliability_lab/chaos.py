@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
 from reliability_lab.circuit_breaker import CircuitBreaker
 from reliability_lab.config import LabConfig, ScenarioConfig
-from reliability_lab.gateway import ReliabilityGateway
+from reliability_lab.gateway import GatewayResponse, ReliabilityGateway
 from reliability_lab.metrics import RunMetrics
 from reliability_lab.providers import FakeLLMProvider
 
@@ -26,67 +28,124 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
     for p in config.providers:
         fail_rate = provider_overrides.get(p.name, p.fail_rate) if provider_overrides else p.fail_rate
         providers.append(FakeLLMProvider(p.name, fail_rate, p.base_latency_ms, p.cost_per_1k_tokens))
+
+    # BONUS: Redis graceful degradation — if backend=redis but Redis is unreachable,
+    # fall back to the in-memory cache instead of failing the whole run. The same
+    # Redis client (when reachable) is also handed to each CircuitBreaker so failure
+    # counters are mirrored across instances (BONUS: Redis circuit state).
+    cache: ResponseCache | SharedRedisCache | None = None
+    redis_client: Any | None = None
+    if config.cache.enabled:
+        if config.cache.backend == "redis":
+            candidate = SharedRedisCache(
+                config.cache.redis_url,
+                config.cache.ttl_seconds,
+                config.cache.similarity_threshold,
+            )
+            if candidate.ping():
+                cache = candidate
+                redis_client = candidate._redis
+            else:
+                candidate.close()
+                print(
+                    f"[reliability_lab] Redis at {config.cache.redis_url} unreachable; "
+                    "degrading to in-memory cache."
+                )
+                cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
+        else:
+            cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
+
     breakers = {
         p.name: CircuitBreaker(
             name=p.name,
             failure_threshold=config.circuit_breaker.failure_threshold,
             reset_timeout_seconds=config.circuit_breaker.reset_timeout_seconds,
             success_threshold=config.circuit_breaker.success_threshold,
+            redis_client=redis_client,
         )
         for p in config.providers
     }
-    cache: ResponseCache | SharedRedisCache | None = None
-    if config.cache.enabled:
-        if config.cache.backend == "redis":
-            cache = SharedRedisCache(
-                config.cache.redis_url,
-                config.cache.ttl_seconds,
-                config.cache.similarity_threshold,
-            )
-        else:
-            cache = ResponseCache(config.cache.ttl_seconds, config.cache.similarity_threshold)
-    return ReliabilityGateway(providers, breakers, cache)
+
+    # BONUS: cost-aware routing — skip expensive providers at warning_pct budget
+    # utilization, cache-only/static fallback once the budget is exhausted.
+    return ReliabilityGateway(
+        providers,
+        breakers,
+        cache,
+        cost_budget=config.budget.total,
+        cost_budget_warning_pct=config.budget.warning_pct,
+    )
 
 
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
-    """Derive recovery time from circuit breaker transition logs.
-
-    TODO(student): Implement recovery time calculation:
-    1. For each breaker in gateway.breakers.values():
-       - Walk breaker.transition_log entries
-       - Track when circuit goes to "open" (save ts)
-       - Track when circuit goes to "closed" (compute delta from open ts)
-       - Recovery time = (close_ts - open_ts) * 1000 (convert to ms)
-    2. Return average of all recovery times, or None if no recovery occurred.
-
-    Each transition_log entry is a dict with keys: "from", "to", "reason", "ts"
-    where "ts" is time.time() (epoch seconds).
-    """
-    raise NotImplementedError("TODO: implement calculate_recovery_time_ms()")
+    recovery_times: list[float] = []
+    for breaker in gateway.breakers.values():
+        open_ts: float | None = None
+        for entry in breaker.transition_log:
+            if entry.get("to") == "open":
+                open_ts = float(entry["ts"])
+            elif entry.get("to") == "closed" and open_ts is not None:
+                close_ts = float(entry["ts"])
+                delta_ms = (close_ts - open_ts) * 1000
+                recovery_times.append(delta_ms)
+                open_ts = None
+    if not recovery_times:
+        return None
+    return sum(recovery_times) / len(recovery_times)
 
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
-    """Run a single named chaos scenario.
+    gateway = build_gateway(config, scenario.provider_overrides or None)
+    metrics = RunMetrics()
 
-    TODO(student): Implement the scenario runner:
-    1. Build gateway with build_gateway(config, scenario.provider_overrides or None)
-    2. Create empty RunMetrics()
-    3. Loop config.load_test.requests times:
-       a. Pick random query from queries
-       b. Call gateway.complete(prompt)
-       c. Update metrics:
-          - total_requests += 1
-          - estimated_cost += result.estimated_cost
-          - If cache_hit: cache_hits += 1, estimated_cost_saved += 0.001
-          - If route == "fallback": fallback_successes += 1, successful_requests += 1
-          - If route == "static_fallback": static_fallbacks += 1, failed_requests += 1
-          - Else: successful_requests += 1
-          - If result.latency_ms > 0: append to latencies_ms
-    4. Count circuit_open_count from breaker transition logs (entries where to == "open")
-    5. Set recovery_time_ms via calculate_recovery_time_ms(gateway)
-    6. Return metrics
-    """
-    raise NotImplementedError("TODO: implement run_scenario()")
+    def do_request(_: int) -> GatewayResponse:
+        query = random.choice(queries)
+        return gateway.complete(query)
+
+    # BONUS: concurrency — when load_test.concurrency > 1, fire requests through a
+    # thread pool against the *same* gateway/breakers/cache to exercise the locks
+    # added to CircuitBreaker and ResponseCache. Results are collected into a plain
+    # list first and aggregated into `metrics` single-threaded below, so the metrics
+    # accumulation itself never needs its own lock.
+    concurrency = max(1, config.load_test.concurrency)
+    if concurrency > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            results = list(executor.map(do_request, range(config.load_test.requests)))
+    else:
+        results = [do_request(i) for i in range(config.load_test.requests)]
+
+    for result in results:
+        metrics.total_requests += 1
+        metrics.estimated_cost += result.estimated_cost
+        
+        if result.cache_hit:
+            metrics.cache_hits += 1
+            metrics.estimated_cost_saved += 0.001
+            
+        if result.route == "fallback":
+            metrics.fallback_successes += 1
+            metrics.successful_requests += 1
+        elif result.route == "static_fallback":
+            metrics.static_fallbacks += 1
+            metrics.failed_requests += 1
+        else:
+            metrics.successful_requests += 1
+            
+        if result.latency_ms > 0:
+            metrics.latencies_ms.append(result.latency_ms)
+            
+    open_count = 0
+    for breaker in gateway.breakers.values():
+        for entry in breaker.transition_log:
+            if entry.get("to") == "open":
+                open_count += 1
+    metrics.circuit_open_count = open_count
+    metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
+    
+    if isinstance(gateway.cache, SharedRedisCache):
+        gateway.cache.close()
+        
+    return metrics
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:

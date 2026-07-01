@@ -13,15 +13,16 @@ circuit_breaker:
   success_threshold: 1
 cache:
   enabled: true
-  backend: memory          # "memory" (default) or "redis" (requires: pip install -e '.[redis]' + docker compose up -d)
+  backend: memory
   ttl_seconds: 300
   similarity_threshold: 0.92
   redis_url: "redis://localhost:6379/0"
 load_test:
   requests: 100
+  concurrency: 8
 
-# Chaos scenarios: each overrides provider fail_rate for targeted testing.
-# TODO(student): Add more scenarios or tweak these.
+# Same scenarios as default.yaml but with concurrency=8, to compare wall-clock
+# time and metrics against the sequential (concurrency=1) default.yaml run.
 scenarios:
   - name: primary_timeout_100
     description: "Primary provider fails 100% — all traffic should fallback"

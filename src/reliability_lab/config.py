@@ -30,6 +30,7 @@ class CacheConfig(BaseModel):
 
 class LoadTestConfig(BaseModel):
     requests: int = Field(gt=0)
+    concurrency: int = Field(default=1, ge=1)
 
 
 class ScenarioConfig(BaseModel):
@@ -38,12 +39,20 @@ class ScenarioConfig(BaseModel):
     provider_overrides: dict[str, float] = Field(default_factory=dict)
 
 
+class BudgetConfig(BaseModel):
+    """BONUS: cost-aware routing. total=None disables budget enforcement."""
+
+    total: float | None = Field(default=None, gt=0.0)
+    warning_pct: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
 class LabConfig(BaseModel):
     providers: list[ProviderConfig]
     circuit_breaker: CircuitBreakerConfig
     cache: CacheConfig
     load_test: LoadTestConfig
     scenarios: list[ScenarioConfig] = Field(default_factory=list)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
 
 
 def load_config(path: str | Path) -> LabConfig:
